@@ -43,8 +43,8 @@ def compute_reward(output: str) -> float:
     Combined reward. This is the function you pass to GRPO.
     """
     score = 0
-    if has_code_block(output): score += 1
-    if has_info_block(output): score += 1
+    if has_code_block(output): score += 2
+    if has_info_block(output): score += 2
     if info_length_ok(output): score += 1
     return float(score)
 
