@@ -20,7 +20,7 @@ import argparse
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel, LoraConfig
 from trl import GRPOTrainer, GRPOConfig
@@ -39,24 +39,6 @@ SYSTEM_PROMPT = (
     "and always wrap your output Python code in <python>...</python> tags. "
     "Never output raw code without these tags."
 )
-
-
-def format_prompt(example: dict) -> dict:
-    """
-    Convert a raw dataset row into the Qwen chat format
-    for GRPO rollout generation.
-    """
-    prompt = example.get("prompt", example.get("text", ""))
-    # Strip any existing assistant turn so model generates fresh
-    if "<|im_start|>assistant" in prompt:
-        prompt = prompt.split("<|im_start|>assistant")[0] + "<|im_start|>assistant\n"
-    else:
-        prompt = (
-            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-    return {"prompt": prompt}
 
 
 # ── Reward wrapper for GRPOTrainer ────────────────────────────────────────
@@ -88,19 +70,14 @@ def load_for_grpo(sft_checkpoint: str, base_model: str | None = None):
     print(f"Base model     : {base_model}")
     print(f"SFT checkpoint : {sft_checkpoint}")
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
+    # Mac GPUs (MPS) do not support bitsandbytes 4-bit quantization.
+    # Loading in 16-bit natively instead so that it can use the GPU.
     base = AutoModelForCausalLM.from_pretrained(
         base_model,
-        quantization_config=bnb,
-        device_map="auto",
+        torch_dtype=torch.bfloat16, # Use bfloat16 to save memory without quantization
+        device_map="auto",          # "auto" will automatically pick "mps" on Mac
         trust_remote_code=True,
     )
-    
     sft_path = Path(sft_checkpoint)
     if sft_path.exists() and sft_path.is_dir():
         model = PeftModel.from_pretrained(base, sft_checkpoint, is_trainable=True)
@@ -130,7 +107,7 @@ def load_for_grpo(sft_checkpoint: str, base_model: str | None = None):
 
 def run_grpo(
     sft_checkpoint: str,
-    data_path: str     = "data/sft_train.jsonl",
+    num_samples: int   = 1000,
     output_dir: str    = "outputs/grpo",
     num_epochs: int    = 1,
     lr: float          = 5e-6,
@@ -144,17 +121,21 @@ def run_grpo(
     print(f"\n{'='*60}")
     print(f"  GRPO Training")
     print(f"  SFT checkpoint : {sft_checkpoint}")
-    print(f"  Data           : {data_path}")
     print(f"  Output         : {output_dir}")
+    print(f"  Samples        : {num_samples}")
     print(f"  Generations/prompt (G) : {num_generations}")
     print(f"{'='*60}\n")
 
     model, tokenizer = load_for_grpo(sft_checkpoint, base_model)
 
-    # Load and format dataset
-    raw_dataset = load_dataset("json", data_files=data_path, split="train")
-    dataset = raw_dataset.map(format_prompt, remove_columns=raw_dataset.column_names)
-    print(f"GRPO dataset: {len(dataset)} prompts")
+    # Create synthetic dataset for automatic generation
+    dummy_prompt = (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\nWrite a random Python script.<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    dataset = Dataset.from_dict({"prompt": [dummy_prompt] * num_samples})
+    print(f"GRPO synthetic dataset: {len(dataset)} prompts")
 
     grpo_config = GRPOConfig(
         output_dir=output_dir,
@@ -198,7 +179,7 @@ def run_grpo(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sft-checkpoint", required=True)
-    parser.add_argument("--data",           default="data/sft_train.jsonl")
+    parser.add_argument("--num-samples",    type=int,   default=1000)
     parser.add_argument("--output-dir",     default="outputs/grpo")
     parser.add_argument("--epochs",         type=int,   default=1)
     parser.add_argument("--lr",             type=float, default=5e-6)
@@ -210,7 +191,7 @@ if __name__ == "__main__":
 
     run_grpo(
         sft_checkpoint=args.sft_checkpoint,
-        data_path=args.data,
+        num_samples=args.num_samples,
         output_dir=args.output_dir,
         num_epochs=args.epochs,
         lr=args.lr,
